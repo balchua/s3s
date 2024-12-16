@@ -2,24 +2,37 @@
 #![deny(clippy::all, clippy::pedantic)]
 #![allow(clippy::needless_return)]
 
+use futures::future::BoxFuture;
+use hyper::Request;
+use hyper::Response;
+use hyper::StatusCode;
+use s3s::Body;
 use s3s_fs::FileSystem;
 use s3s_fs::Result;
 
 use s3s::auth::SimpleAuth;
 use s3s::host::MultiDomain;
 use s3s::service::S3ServiceBuilder;
+use tower::Layer;
+use tower::Service;
+use tower_http::cors::CorsLayer;
 
 use std::io::IsTerminal;
 use std::ops::Not;
 use std::path::PathBuf;
+use std::task::Context;
+use std::task::Poll;
 
 use tokio::net::TcpListener;
 
 use clap::{CommandFactory, Parser};
 use tracing::info;
 
+use futures::future::ready;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use hyper_util::service::TowerToHyperService;
+use s3s::S3Error;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -142,7 +155,17 @@ async fn run(opt: Opt) -> Result {
             }
         };
 
-        let conn = http_server.serve_connection(TokioIo::new(socket), hyper_service.clone());
+        let io = TokioIo::new(socket);
+
+        let conn = http_server.serve_connection(
+            io,
+            TowerToHyperService::new(
+                tower::ServiceBuilder::new()
+                    .layer(BodyLimitLayer::new(1024 * 1024 * 5))
+                    // .layer(ConcurrencyLimitLayer::new(2))
+                    .service(hyper_service.clone()),
+            ),
+        );
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {
             let _ = conn.await;
@@ -160,4 +183,71 @@ async fn run(opt: Opt) -> Result {
 
     info!("server is stopped");
     Ok(())
+}
+
+#[derive(Clone)]
+struct BodyLimitLayer {
+    limit: usize,
+}
+
+impl BodyLimitLayer {
+    fn new(limit: usize) -> Self {
+        Self { limit }
+    }
+}
+
+impl<S> Layer<S> for BodyLimitLayer {
+    type Service = BodyLimit<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        BodyLimit {
+            inner,
+            limit: self.limit,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BodyLimit<S> {
+    inner: S,
+    limit: usize,
+}
+
+impl<S> BodyLimit<S> {
+    fn new(inner: S, limit: usize) -> Self {
+        Self { inner, limit }
+    }
+}
+
+impl<S, ReqBody> Service<Request<ReqBody>> for BodyLimit<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<Body>, Error = S3Error> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: hyper::body::Body + Send + 'static,
+    ReqBody::Data: Send,
+{
+    type Response = Response<Body>;
+    type Error = S3Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        if let Some(content_length) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+            if let Ok(content_length) = content_length.to_str().and_then(|s| Ok(s.parse::<usize>().map_err(|_| ()))) {
+                if content_length > Ok(self.limit) {
+                    let response = Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(Body::from(b"Payload too large".to_vec()))
+                        .unwrap();
+                    return Box::pin(ready(Ok(response)));
+                }
+            }
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
 }
